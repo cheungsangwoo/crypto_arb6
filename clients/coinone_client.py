@@ -382,13 +382,19 @@ class CoinoneClient(BaseSpotClient):
     @staticmethod
     def _fmt_price(price: float) -> str:
         """Format a KRW price for Coinone's API.
-        For prices >= 1 KRW, send as integer (e.g. '423').
-        For prices < 1 KRW, preserve decimal places (e.g. '0.423').
-        Using int() on sub-1 prices would send '0', causing error 308.
+        Preserves decimal precision from the orderbook price.
+        - For prices < 1 KRW: keep decimal places (e.g. '0.423').
+        - For prices >= 1 KRW that are effectively integers: send as integer (e.g. '423').
+        - For prices >= 1 KRW with decimal parts: preserve up to 2dp (e.g. '36.69').
+          Using str(int(price)) on a decimal price (e.g. 36.69 -> '36') sends a price
+          below the ask, causing the IOC order to never fill.
         """
-        if price >= 1:
-            return str(int(price))
-        return str(price)
+        if price < 1:
+            return str(price)
+        rounded = round(price, 2)
+        if rounded == int(rounded):
+            return str(int(rounded))
+        return str(rounded)
 
     async def create_limit_buy_order(
         self, symbol: str, quantity: float, price: float
@@ -721,6 +727,13 @@ class CoinoneClient(BaseSpotClient):
                 order_info = await self.fetch_order(order_id, symbol)
 
             filled = float(order_info.get("filled", 0.0))
+
+            # Slow-API safety net: Coinone may not reflect fills immediately after cancel
+            if filled == 0:
+                await asyncio.sleep(1.0)
+                order_info = await self.fetch_order(order_id, symbol)
+                filled = float(order_info.get("filled", 0.0))
+
             avg_price = price  # Assume limit price if filled
 
             return {"id": order_id, "filled": filled, "avg_price": avg_price}

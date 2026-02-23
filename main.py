@@ -258,7 +258,8 @@ async def run_bot():
 
                 # C. Execute Snipe
                 if market_data:
-                    await manager.execute_maker_strategy(market_data)
+                    await manager.execute_taker_strategy(market_data)  # Upbit + Coinone IOC
+                    await manager.execute_maker_strategy(market_data)  # Bithumb maker only
 
                 # D. Execute Active Exit (New)
                 await manager.run_active_exit()

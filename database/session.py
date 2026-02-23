@@ -28,10 +28,28 @@ def get_db():
         db.close()
 
 
+def run_migrations(engine):
+    """Add new columns to existing tables. Safe to call on every startup."""
+    from sqlalchemy import text
+
+    migrations = [
+        "ALTER TABLE positions ADD COLUMN calc_entry_premium_ask FLOAT",
+        "ALTER TABLE strategy_collector ADD COLUMN entry_premium_pct_ask FLOAT",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # Column already exists — ignore
+
+
 def init_db():
     """Creates all tables defined in models.py"""
     # Import Base here to avoid circular imports
     from database.models import Base
 
     Base.metadata.create_all(bind=engine)
+    run_migrations(engine)
     print("✅ Database tables initialized.")

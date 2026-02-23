@@ -52,6 +52,7 @@ class Position(Base):
     config_entry_threshold = Column(Float)
     config_exit_threshold = Column(Float, nullable=True)
     calc_entry_premium = Column(Float)
+    calc_entry_premium_ask = Column(Float, nullable=True)  # ask-price-based at entry
     calc_exit_premium = Column(Float, nullable=True)
 
     # Integrity (Order IDs)
@@ -89,6 +90,7 @@ class StrategyCollector(Base):
     implied_fx = Column(Float)
     kimchi_premium_pct = Column(Float)
     entry_premium_pct = Column(Float)
+    entry_premium_pct_ask = Column(Float, nullable=True)  # ask-price-based
     exit_premium_pct = Column(Float)
 
     ref_usdt_ask = Column(Float)

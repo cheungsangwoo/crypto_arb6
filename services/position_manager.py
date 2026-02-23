@@ -171,12 +171,14 @@ class PositionManager:
         if self.rule_manager:
             await self.rule_manager.close()
 
-    # --- [LEG 1] ACTIVE MAKER STRATEGY ---
+    # --- [LEG 1] ACTIVE MAKER STRATEGY (Bithumb only) ---
     async def execute_maker_strategy(self, market_data: Dict):
         # 1. Filter & Sort (Same as before)
         all_opps = []
         for coin, exchanges in market_data.items():
             for exch, data in exchanges.items():
+                if exch in ("UPBIT", "COINONE"):  # taker path handles these
+                    continue
                 threshold = self.thresholds.get(exch, {}).get("ENTRY", -0.5)
                 if data["entry_premium"] > threshold:
                     continue
@@ -1237,6 +1239,52 @@ class PositionManager:
                     active_symbols.add(symbol)
                     self.exchange_slots[exch] -= 1
 
+    # --- [LEG 1b] IOC TAKER STRATEGY (Upbit + Coinone) ---
+    _TAKER_EXCHANGES = {"UPBIT", "COINONE"}
+
+    async def execute_taker_strategy(self, market_data: Dict):
+        """IOC entry at ask price for Upbit and Coinone."""
+        all_opps = []
+        for coin, exchanges in market_data.items():
+            for exch, data in exchanges.items():
+                if exch not in self._TAKER_EXCHANGES:
+                    continue
+                threshold = self.thresholds.get(exch, {}).get("ENTRY", -0.5)
+                if data.get("entry_premium_ask", 0) > threshold:
+                    continue
+                if not data.get("valid_liquidity", False):
+                    continue
+                all_opps.append(data)
+
+        all_opps.sort(key=lambda x: x.get("entry_premium_ask", 0))
+        active_positions = self.get_active_positions()
+        current_global_count = len(active_positions)
+        active_symbols = {p.symbol for p in active_positions}
+
+        for opp in all_opps:
+            if current_global_count >= self.MAX_POSITIONS:
+                break
+            symbol = opp["symbol"]
+            exch = opp["spot_exchange"]
+            if symbol in active_symbols:
+                continue
+            if self.exchange_slots.get(exch, 0) <= 0:
+                continue
+            async with self.get_symbol_lock(symbol):
+                has_orphan = await self._check_orphaned_holdings(
+                    symbol, exch, current_price=opp["spot_ask"]
+                )
+                if has_orphan:
+                    logger.warning(
+                        f"   🛑 Safety Block: {symbol} exists in wallet but not DB. Skipping Buy."
+                    )
+                    continue
+                success = await self._attempt_snipe(opp)
+                if success:
+                    current_global_count += 1
+                    active_symbols.add(symbol)
+                    self.exchange_slots[exch] -= 1
+
     async def _check_orphaned_holdings(
         self, symbol: str, exchange: str, current_price: float = None
     ) -> bool:
@@ -1276,7 +1324,12 @@ class PositionManager:
         symbol = opp["symbol"]
         exch = opp["spot_exchange"]
         client = self.spot_clients.get(exch)
-        price = self.adjust_price_to_tick(opp["spot_ask"])
+        # Use the raw ask price — it's already a valid tick price from the exchange orderbook.
+        # Applying adjust_price_to_tick (which floors to Upbit's coarser 0.1 tick) would push
+        # the price below the ask, causing the IOC order to never fill on exchanges like Coinone
+        # that use a finer 0.01 tick. The exchange's own price formatter (_fmt_price) handles
+        # any final formatting.
+        price = opp["spot_ask"]
         ref_fx = opp["ref_fx"]
         SPOT_FEE_RATE = 0.0004 if exch == "BITHUMB" else 0.0005
         HEDGE_FEE_RATE = 0.0005
@@ -1473,6 +1526,7 @@ class PositionManager:
                     entry_usdt_rate=ref_fx,
                     config_entry_threshold=conf_entry,
                     calc_entry_premium=opp["entry_premium"],
+                    calc_entry_premium_ask=opp.get("entry_premium_ask"),
                     entry_spot_order_id=str(order_res.get("id", "")),
                     entry_hedge_order_id=str(final_hedge_res.get("id", "")),
                 )
@@ -1532,6 +1586,7 @@ class PositionManager:
                     entry_usdt_rate=ref_fx,
                     config_entry_threshold=0.0,
                     calc_entry_premium=opp["entry_premium"],
+                    calc_entry_premium_ask=opp.get("entry_premium_ask"),
                     entry_spot_order_id=str(order_res.get("id", "")),
                     entry_hedge_order_id="partial_rescue",
                 )

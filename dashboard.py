@@ -149,66 +149,77 @@ if snap is not None:
     with c4:
         st.metric("FX Rate", f"₩{snap['fx_rate']:,.1f}")
 
-# 2. PORTFOLIO CHART (Last 24h)
+# 2. PORTFOLIO CHART (Last 24h) — all three series indexed to 100 at period start
 st.subheader("📈 Portfolio Performance (24h)")
 df_chart = get_portfolio_history()
 if not df_chart.empty:
-    chart_col1, chart_col2 = st.columns(2)
+    base_usdt = df_chart["total_usdt_value"].iloc[0]
+    base_krw  = df_chart["total_krw_value"].iloc[0]
+    base_fx   = df_chart["fx_rate"].iloc[0]
 
-    with chart_col1:
-        st.caption("Equity (USDT)")
-        chart_usdt = (
-            alt.Chart(df_chart)
-            .mark_line(color="#00FFAA")
+    if base_usdt > 0 and base_krw > 0 and base_fx > 0:
+        df_chart = df_chart.copy()
+        df_chart["USDT Equity"] = df_chart["total_usdt_value"] / base_usdt * 100
+        df_chart["KRW Equity"]  = df_chart["total_krw_value"]  / base_krw  * 100
+        df_chart["FX Rate"]     = df_chart["fx_rate"]          / base_fx   * 100
+
+        df_long = df_chart[["timestamp", "USDT Equity", "KRW Equity", "FX Rate"]].melt(
+            id_vars="timestamp", var_name="Series", value_name="Index"
+        )
+
+        # Last data point per series — used for end-of-line percentage labels
+        df_ends = (
+            df_long.sort_values("timestamp")
+            .groupby("Series", as_index=False)
+            .last()
+        )
+        df_ends["label"] = df_ends["Index"].apply(lambda v: f"{v - 100:+.1f}%")
+
+        _domain = ["USDT Equity", "KRW Equity", "FX Rate"]
+        _range  = ["#00FFAA",     "#FFB300",     "#FF4B4B"]
+
+        lines = (
+            alt.Chart(df_long)
+            .mark_line(strokeWidth=2)
             .encode(
-                x=alt.X("timestamp", axis=alt.Axis(title="Time", format="%H:%M")),
+                x=alt.X("timestamp:T", axis=alt.Axis(title="Time", format="%H:%M")),
                 y=alt.Y(
-                    "total_usdt_value",
+                    "Index:Q",
                     scale=alt.Scale(zero=False),
-                    axis=alt.Axis(title="Equity (USDT)"),
+                    axis=alt.Axis(title="Indexed to period start  (100 = unchanged)"),
                 ),
-                tooltip=["timestamp", "total_usdt_value"],
+                color=alt.Color(
+                    "Series:N",
+                    scale=alt.Scale(domain=_domain, range=_range),
+                    legend=alt.Legend(orient="top-left"),
+                ),
+                tooltip=[
+                    alt.Tooltip("timestamp:T", title="Time", format="%m-%d %H:%M"),
+                    alt.Tooltip("Series:N"),
+                    alt.Tooltip("Index:Q", format=".2f"),
+                ],
             )
-            .properties(height=250)
-        )
-        st.altair_chart(chart_usdt, use_container_width=True)
-
-    with chart_col2:
-        st.caption("Equity (KRW) & FX Rate")
-
-        # Shared X-axis base
-        base = alt.Chart(df_chart).encode(
-            x=alt.X("timestamp", axis=alt.Axis(title="Time", format="%H:%M"))
         )
 
-        # KRW Line (Left Y-Axis)
-        line_krw = base.mark_line(color="#FFB300").encode(
-            y=alt.Y(
-                "total_krw_value",
-                scale=alt.Scale(zero=False),
-                axis=alt.Axis(title="Equity (KRW)", titleColor="#FFB300"),
-            ),
-            tooltip=["timestamp", "total_krw_value"],
+        end_labels = (
+            alt.Chart(df_ends)
+            .mark_text(align="left", dx=5, fontWeight="bold", fontSize=12)
+            .encode(
+                x=alt.X("timestamp:T"),
+                y=alt.Y("Index:Q"),
+                text=alt.Text("label:N"),
+                color=alt.Color(
+                    "Series:N",
+                    scale=alt.Scale(domain=_domain, range=_range),
+                    legend=None,  # legend already shown on the lines layer
+                ),
+            )
         )
 
-        # FX Rate Line (Right Y-Axis)
-        line_fx = base.mark_line(color="#FF4B4B").encode(
-            y=alt.Y(
-                "fx_rate",
-                scale=alt.Scale(zero=False),
-                axis=alt.Axis(title="FX Rate", titleColor="#FF4B4B"),
-            ),
-            tooltip=["timestamp", "fx_rate"],
+        st.altair_chart(
+            (lines + end_labels).properties(height=320, padding={"right": 70}),
+            use_container_width=True,
         )
-
-        # Superimpose and resolve Y-axes to be independent
-        chart_dual = (
-            alt.layer(line_krw, line_fx)
-            .resolve_scale(y="independent")
-            .properties(height=250)
-        )
-
-        st.altair_chart(chart_dual, use_container_width=True)
 
 # 3. CONTROL PANEL
 st.subheader("⚙️ Bot Controls")

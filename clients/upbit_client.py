@@ -332,6 +332,12 @@ class UpbitClient(BaseSpotClient):
 
             filled = float(order_info.get("filled", 0.0))
 
+            # Slow-API safety net: Upbit may not reflect fills immediately after cancel
+            if filled == 0:
+                await asyncio.sleep(1.0)
+                order_info = await self.fetch_order(order_id)
+                filled = float(order_info.get("filled", 0.0))
+
             # 4. Calculate Weighted Average Price from Trades
             trades = order_info.get("trades", [])
             avg_price = price

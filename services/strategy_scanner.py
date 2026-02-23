@@ -228,6 +228,10 @@ class StrategyScanner:
                     implied_fx_entry = u_bid / b_bid_scaled
                     entry_premium = ((implied_fx_entry - ref_ask) / ref_ask) * 100
 
+                    # Ask-based entry premium (for IOC taker entry on Upbit/Coinone)
+                    implied_fx_entry_ask = u_ask / b_bid_scaled
+                    entry_premium_ask = ((implied_fx_entry_ask - ref_ask) / ref_ask) * 100
+
                     # Exit: We Sell Spot @ Ask, Buy Future @ Ask
                     implied_fx_exit = u_ask / b_ask_scaled
                     exit_premium = ((implied_fx_exit - ref_ask) / ref_ask) * 100
@@ -249,9 +253,11 @@ class StrategyScanner:
                         "symbol": coin,
                         "spot_exchange": name,
                         "entry_premium": entry_premium,
+                        "entry_premium_ask": entry_premium_ask,
                         "exit_premium": exit_premium,
                         "spot_bid": u_bid,
                         "spot_ask": u_ask,
+                        "spot_ask_size": u_data.get("ask_size", 0),
                         "binance_bid": b_bid_scaled,  # Crucial for Active Monitor
                         "binance_ask": b_ask_scaled,
                         "binance_symbol_key": b_key,
@@ -276,6 +282,7 @@ class StrategyScanner:
                             implied_fx=implied_fx_entry,
                             kimchi_premium_pct=entry_premium,
                             entry_premium_pct=entry_premium,
+                            entry_premium_pct_ask=entry_premium_ask,
                             exit_premium_pct=exit_premium,
                             annualized_funding_pct=b_data["funding_rate"]
                             * 3

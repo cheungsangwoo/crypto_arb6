@@ -1,14 +1,14 @@
 {
     "UPBIT": {
-        "ENTRY": -1.0,
+        "ENTRY": -0.5,
         "EXIT": 0.5
     },
     "BITHUMB": {
-        "ENTRY": -1.0,
+        "ENTRY": -0.5,
         "EXIT": 0.5
     },
     "COINONE": {
-        "ENTRY": -1.0,
+        "ENTRY": -0.5,
         "EXIT": 0.5
     },
     "SYSTEM": {

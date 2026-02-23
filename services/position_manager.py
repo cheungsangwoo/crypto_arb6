@@ -118,6 +118,7 @@ class PositionManager:
             if "-2022" in e_str or "ReduceOnly" in e_str or "Order's notional" in e_str:
                 logger.warning(f"   ⚠️ Hedge Close Skipped (Likely already 0): {e_str}")
                 return True, 0.0, "already_closed"
+            logger.error(f"   ❌ _safe_close_hedge FAILED: {symbol_slash} qty={qty} | {e_str}")
             return False, 0.0, str(e)
 
     # --- [FIX] NEW LEVERAGE HELPER ---
@@ -257,19 +258,7 @@ class PositionManager:
                 if (qty * price) < self.MIN_TRADE_VALUE_KRW:
                     return None
 
-                # DEBUG: Log order placement for all exchanges, especially Coinone
-                if opp["spot_exchange"] == "COINONE":
-                    logger.info(
-                        f"   🔍 DEBUG COINONE: Placing {opp['symbol']} order | Client: {client.__class__.__name__} | Qty: {qty} @ {price}"
-                    )
-
                 res = await client.create_limit_buy_order(opp["symbol"], qty, price)
-
-                # DEBUG: Log successful order creation
-                if opp["spot_exchange"] == "COINONE":
-                    logger.info(
-                        f"   ✅ DEBUG COINONE: Order placed successfully. ID: {res.get('id') or res.get('uuid')}"
-                    )
 
                 return {
                     "id": res.get("id") or res.get("uuid"),
@@ -285,10 +274,6 @@ class PositionManager:
                     f"   ❌ Order Fail {opp['symbol']} ({opp['spot_exchange']}): {e}"
                 )
                 self.exchange_slots[opp["spot_exchange"]] += 1  # Refund slot
-                if opp["spot_exchange"] == "COINONE":
-                    logger.error(
-                        f"   🔍 DEBUG COINONE ERROR: {type(e).__name__}: {str(e)}"
-                    )
                 return None
 
         tasks = [place_wrapper(o) for o in batch_opps]
@@ -789,6 +774,14 @@ class PositionManager:
         if not active:
             return
 
+        # [FIX] Pre-fetch balances once per loop to stop API Rate Limit bans
+        cached_balances = {}
+        for name, client in self.spot_clients.items():
+            try:
+                cached_balances[name] = await client.fetch_balance()
+            except Exception:
+                cached_balances[name] = {}
+
         # 1. Fetch Binance Data Globally (One request for all)
         try:
             tickers_map = await self.binance.fetch_bids_asks()
@@ -809,22 +802,28 @@ class PositionManager:
             chunk = active[i : i + BATCH_SIZE]
             for pos in chunk:
                 # Fire and forget (background task)
-                asyncio.create_task(self._manage_single_active_exit(pos, bin_asks))
+                asyncio.create_task(
+                    self._manage_single_active_exit(pos, bin_asks, cached_balances)
+                )
 
             # Sleep 1.0s between spawning batches to protect Upbit Limit (8/s)
             # This consumes time in the main loop but allows for cleaner API usage
             if (i + BATCH_SIZE) < len(active):
                 await asyncio.sleep(1.0)
 
-    async def _manage_single_active_exit(self, pos: Position, bin_map: Dict):
+    async def _manage_single_active_exit(
+        self, pos: Position, bin_map: Dict, cached_balances: Dict
+    ):
         # Lock to ensure we don't conflict with Entry/Sync logic
         if self.get_symbol_lock(pos.symbol).locked():
             return
 
         async with self.get_symbol_lock(pos.symbol):
             client = self.spot_clients.get(pos.exchange)
-            bal = await client.fetch_balance()
+            # [FIX] Read from the cache instead of hitting the API
+            bal = cached_balances.get(pos.exchange, {})
             free = bal.get(pos.symbol, {}).get("free", 0.0)
+
             if free < (pos.current_spot_qty * 0.9):
                 return
 
@@ -887,9 +886,23 @@ class PositionManager:
                             pos.exchange,
                             is_binance=True,
                         )
-                        success, ex_price, _ = await self._safe_close_hedge(
-                            f"{b_key}/USDT", h_qty
-                        )
+                        ex_price = None
+                        if h_qty <= 0:
+                            logger.critical(
+                                f"   ☠️ HEDGE SKIP: {pos.symbol} h_qty=0 "
+                                f"(DB current_hedge_qty={pos.current_hedge_qty:.4f}). "
+                                f"Check Binance for open {b_key} SHORT and close manually!"
+                            )
+                        else:
+                            h_success, ex_price, _ = await self._safe_close_hedge(
+                                f"{b_key}/USDT", h_qty
+                            )
+                            if not h_success:
+                                logger.critical(
+                                    f"   ☠️ HEDGE CLOSE FAILED: {pos.symbol} | "
+                                    f"Tried {b_key}/USDT qty={h_qty:.4f}. "
+                                    f"Spot SOLD but Binance SHORT still open — manual close required!"
+                                )
                         self._finalize_db_exit(
                             pos,
                             filled,
@@ -1036,10 +1049,10 @@ class PositionManager:
                     logger.debug(
                         f"   🔍 DEBUG {name}: Balance fetch - Free KRW: {free_krw}, Full balance: {bal}"
                     )
-                    if name == "COINONE":
-                        logger.info(
-                            f"   🔍 DEBUG COINONE: fetch_balance() returned: {bal}"
-                        )
+                    # if name == "COINONE":
+                    #     logger.info(
+                    #         f"   🔍 DEBUG COINONE: fetch_balance() returned: {bal}"
+                    #     )
 
                     # Calculate slots using the shared rate updated from the scanner
                     self.exchange_slots[name] = int(
@@ -1047,13 +1060,13 @@ class PositionManager:
                     )
 
                     # DEBUG: Log allocated slots
-                    logger.debug(
-                        f"   💰 {name} Capacity: {self.exchange_slots[name]} slots ({free_krw:,.0f} KRW Free)"
-                    )
-                    if name == "COINONE":
-                        logger.info(
-                            f"   🔍 DEBUG COINONE: Allocated {self.exchange_slots[name]} slots"
-                        )
+                    # logger.debug(
+                    #     f"   💰 {name} Capacity: {self.exchange_slots[name]} slots ({free_krw:,.0f} KRW Free)"
+                    # )
+                    # if name == "COINONE":
+                    # logger.info(
+                    #     f"   🔍 DEBUG COINONE: Allocated {self.exchange_slots[name]} slots"
+                    # )
 
                 except Exception as e:
                     logger.error(f"   ❌ Balance Fetch Error for {name}: {e}")
@@ -1675,8 +1688,17 @@ class PositionManager:
 
                     hedge_exit_price = 0.0
                     hedge_exit_id = ""
+                    hedge_close_ok = True  # assume success unless proven otherwise
 
-                    if hedge_close_qty > 0:
+                    if hedge_close_qty <= 0:
+                        # DB had 0 hedge qty — spot was sold but Binance short may still be open
+                        logger.critical(
+                            f"   ☠️ HEDGE SKIP: {symbol} hedge_close_qty=0 "
+                            f"(DB current_hedge_qty={pos.current_hedge_qty:.4f}). "
+                            f"Check Binance for open {b_key} SHORT and close manually!"
+                        )
+                        hedge_close_ok = False
+                    else:
                         b_sym_slash = f"{b_key}/USDT"
 
                         # [FIX] Use Safe Close Helper
@@ -1688,6 +1710,13 @@ class PositionManager:
                             # If price is 0 (already closed elsewhere), use last known or Estimate
                             hedge_exit_price = ex_price or bin_ask_unit
                             hedge_exit_id = ex_id or "safe_close"
+                        else:
+                            hedge_close_ok = False
+                            logger.critical(
+                                f"   ☠️ HEDGE CLOSE FAILED: {symbol} | "
+                                f"Tried {b_sym_slash} qty={hedge_close_qty:.4f}. "
+                                f"Spot SOLD but Binance SHORT still open — manual close required!"
+                            )
 
                     # --- [NEW] UPDATE SINGLE POSITIONS TABLE ---
                     with SessionLocal() as db:
@@ -1747,9 +1776,16 @@ class PositionManager:
                             db_pos.current_spot_qty = 0
                             db_pos.current_hedge_qty = 0
                             db.commit()
-                            logger.info(
-                                f"   ✅ Trade Closed: {symbol} | Net PnL: ${net_pnl:.2f}"
-                            )
+                            if hedge_close_ok:
+                                logger.info(
+                                    f"   ✅ Trade Closed: {symbol} | Net PnL: ${net_pnl:.2f}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"   ⚠️ Trade Closed (SPOT ONLY): {symbol} | "
+                                    f"Net PnL: ${net_pnl:.2f} | "
+                                    f"*** Binance {b_key} SHORT was NOT closed — close manually! ***"
+                                )
                         else:
                             db_pos.current_spot_qty -= filled
                             db_pos.current_hedge_qty -= hedge_close_qty
@@ -1814,6 +1850,7 @@ class PositionManager:
                 bin_total
                 + (total_spot_krw_value / ref_fx)
                 + (total_spot_free_krw / ref_fx)
+                + total_unrealized_pnl  # <--- YOU MUST ADD THIS
             )
             inv_val_usdt = total_spot_krw_value / ref_fx
 

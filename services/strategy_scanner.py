@@ -48,6 +48,7 @@ class StrategyScanner:
             "SOLVE",
             "BTC",
             "PAXG",
+            "FIDA",
         ]
 
         self.SANITY_PREMIUM_LIMIT = -30.0
@@ -159,6 +160,8 @@ class StrategyScanner:
         KST = timezone(timedelta(hours=9))
         timestamp = datetime.now(KST).replace(tzinfo=None)
 
+        ref_ask = 1450.0
+
         for name, client in self.spot_clients.items():
             exch_entry_premiums = []
             exch_exit_premiums = []
@@ -192,9 +195,8 @@ class StrategyScanner:
                     continue
 
                 # Fetch USDT Ref
-                ref_ask = 1450.0
                 usdt_book = orderbooks.get("KRW-USDT") or orderbooks.get("USDT/KRW")
-                if usdt_book:
+                if usdt_book and usdt_book.get("ask", 0) > 0:
                     ref_ask = usdt_book["ask"]
 
                 for coin, b_key in target_coins:

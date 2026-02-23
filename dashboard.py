@@ -214,7 +214,7 @@ if not df_chart.empty:
 st.subheader("⚙️ Bot Controls")
 config = load_config()
 if config:
-    c_sys, c_up, c_bi = st.columns([1, 2, 2])
+    c_sys, c_up, c_bi, c_co = st.columns([1, 2, 2, 2])
 
     with c_sys:
         is_paused = config.get("SYSTEM", {}).get("PAUSED", False)
@@ -262,15 +262,36 @@ if config:
             key="b_x",
         )
 
+    with c_co:
+        st.caption("COINONE Thresholds")
+        co_entry = st.number_input(
+            "Entry %",
+            value=float(config.get("COINONE", {}).get("ENTRY", -1.0)),
+            step=0.1,
+            format="%.2f",
+            key="co_e",
+        )
+        co_exit = st.number_input(
+            "Exit %",
+            value=float(config.get("COINONE", {}).get("EXIT", 2.0)),
+            step=0.1,
+            format="%.2f",
+            key="co_x",
+        )
+
     if st.button("💾 Save Thresholds"):
         if "UPBIT" not in config:
             config["UPBIT"] = {}
         if "BITHUMB" not in config:
             config["BITHUMB"] = {}
+        if "COINONE" not in config:
+            config["COINONE"] = {}
         config["UPBIT"]["ENTRY"] = u_entry
         config["UPBIT"]["EXIT"] = u_exit
         config["BITHUMB"]["ENTRY"] = b_entry
         config["BITHUMB"]["EXIT"] = b_exit
+        config["COINONE"]["ENTRY"] = co_entry
+        config["COINONE"]["EXIT"] = co_exit
         save_config(config)
         st.success("Configuration Updated!")
 

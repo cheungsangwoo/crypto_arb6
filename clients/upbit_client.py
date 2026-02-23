@@ -263,13 +263,29 @@ class UpbitClient(BaseSpotClient):
         ]
 
     async def cancel_all_orders(self):
+        """Cancel all open KRW orders via batch endpoint (DELETE /v1/orders/open).
+        Single atomic call — no prior fetch needed, handles any number of orders."""
         try:
-            orders = await self.fetch_open_orders()
-            if not orders:
-                return
-            for o in orders:
-                await self.cancel_order(o["id"])
-                await asyncio.sleep(0.1)
+            params = {"quote_currencies": "KRW"}
+            headers = self._get_headers(params)
+
+            def _delete():
+                return self.session.delete(
+                    f"{self.server_url}/v1/orders/open",
+                    params=params,
+                    headers=headers,
+                    timeout=10,
+                )
+
+            res = await asyncio.to_thread(_delete)
+            if res.status_code == 200:
+                cancelled = res.json()
+                if cancelled:
+                    logger.info(f"   Upbit: batch-cancelled {len(cancelled)} open orders")
+            elif res.status_code != 404:
+                logger.error(
+                    f"   ❌ Upbit batch cancel failed ({res.status_code}): {res.text[:200]}"
+                )
         except Exception as e:
             logger.error(f"   ❌ Upbit Cancel All Error: {e}")
 

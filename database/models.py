@@ -54,6 +54,7 @@ class Position(Base):
     calc_entry_premium = Column(Float)
     calc_entry_premium_ask = Column(Float, nullable=True)  # ask-price-based at entry
     calc_exit_premium = Column(Float, nullable=True)
+    exit_reason = Column(String(50), nullable=True)  # NORMAL | MAX_HOLD | ACTIVE_TAKER | HEDGE_FAILED
 
     # Integrity (Order IDs)
     entry_spot_order_id = Column(String(100))
@@ -134,3 +135,15 @@ class MarketMetric(Base):
     median_entry_premium = Column(Float)
     median_exit_premium = Column(Float)
     opportunity_count = Column(Integer)
+
+
+class CapitalEvent(Base):
+    """Records capital deposits (+) and withdrawals (-) so the dashboard
+    can compute organic P&L independently of capital changes."""
+    __tablename__ = "capital_events"
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=kst_now)
+    amount_krw = Column(Float, nullable=False)   # positive = deposit, negative = withdrawal
+    amount_usdt = Column(Float, nullable=False)   # converted at fx_rate
+    fx_rate = Column(Float, nullable=False)
+    notes = Column(String(200), nullable=True)

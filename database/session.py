@@ -35,6 +35,16 @@ def run_migrations(engine):
     migrations = [
         "ALTER TABLE positions ADD COLUMN calc_entry_premium_ask FLOAT",
         "ALTER TABLE strategy_collector ADD COLUMN entry_premium_pct_ask FLOAT",
+        "ALTER TABLE positions ADD COLUMN exit_reason VARCHAR(50)",
+        # Capital event tracking — safe to run multiple times (IF NOT EXISTS)
+        """CREATE TABLE IF NOT EXISTS capital_events (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            timestamp DATETIME NOT NULL,
+            amount_krw FLOAT NOT NULL,
+            amount_usdt FLOAT NOT NULL,
+            fx_rate FLOAT NOT NULL,
+            notes VARCHAR(200)
+        )""",
     ]
     with engine.connect() as conn:
         for sql in migrations:

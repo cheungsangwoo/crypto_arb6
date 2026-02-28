@@ -1,17 +1,19 @@
 {
     "UPBIT": {
-        "ENTRY": -0.5,
+        "ENTRY": -0.9999999999999999,
         "EXIT": 0.5
     },
     "BITHUMB": {
-        "ENTRY": -0.5,
+        "ENTRY": -0.9999999999999999,
         "EXIT": 0.5
     },
     "COINONE": {
-        "ENTRY": -0.5,
-        "EXIT": 0.5
+        "ENTRY": -1.5,
+        "EXIT": 0.0
     },
     "SYSTEM": {
-        "PAUSED": false
-    }
+        "PAUSED": false,
+        "BATCH_SIZE_USDT": 200
+    },
+    "BLACKLIST": []
 }

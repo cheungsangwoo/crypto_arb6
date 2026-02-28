@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from logging.handlers import RotatingFileHandler
 
 # Services
+from utils.telegram_logger import TelegramHandler
 from clients.upbit_client import UpbitClient
 from clients.bithumb_client import BithumbClient
 from clients.coinone_client import CoinoneClient
@@ -24,6 +25,9 @@ from database.session import init_db
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
+
+load_dotenv(override=True)
 
 
 def setup_logging():
@@ -52,10 +56,20 @@ def setup_logging():
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
+    # Telegram handler — attaches if both env vars are present
+    tg_token = os.getenv("TELEGRAM_API_KEY")
+    tg_chat  = os.getenv("TELEGRAM_CHAT_ID")
+    if tg_token and tg_chat:
+        tg_handler = TelegramHandler(tg_token, tg_chat)
+        tg_handler.setLevel(logging.INFO)
+        root_logger.addHandler(tg_handler)
+        print("✅ Telegram logging enabled.")
+    else:
+        print("⚠️  Telegram logging disabled (TELEGRAM_API_KEY / TELEGRAM_CHAT_ID not set).")
+
 
 setup_logging()
 logger = logging.getLogger("Main")
-load_dotenv(override=True)
 init_db()
 
 # Global Shutdown Event
@@ -88,6 +102,11 @@ async def background_exit_loop(manager):
 
             if is_paused:
                 await asyncio.sleep(10)
+                continue
+
+            # Back off during network outages (flag set by main loop circuit breaker)
+            if manager.network_degraded:
+                await asyncio.sleep(10.0)
                 continue
 
             # Run the parallel exit logic (Limit Sell -> Wait -> Hedge)
@@ -162,6 +181,10 @@ async def run_bot():
 
     # State tracking for Pause Mode
     was_paused = False
+
+    # Circuit-breaker state
+    consecutive_scan_failures = 0
+    _was_network_degraded = False
 
     # 5. Main Sniper Loop
     try:
@@ -246,11 +269,36 @@ async def run_bot():
                     last_snapshot_time = current_time
 
                 # B. Scan Market
-                market_data, current_fx = await scanner.scan()  # [CHANGE]
+                market_data, current_fx = await scanner.scan()
 
-                # 3. Update Manager with the fresh rate BEFORE syncing/executing
-                if current_fx > 0:
-                    manager.shared_fx_rate = current_fx  # [NEW]
+                # Circuit breaker: if Binance/network is unreachable, back off
+                # instead of hammering every API every few seconds.
+                if current_fx <= 0:
+                    consecutive_scan_failures += 1
+                    manager.network_degraded = True
+                    if consecutive_scan_failures >= 3:
+                        backoff = min(30 * (2 ** (consecutive_scan_failures - 3)), 300)
+                        if not _was_network_degraded:
+                            logger.warning(
+                                f"🔌 Network outage detected. "
+                                f"Pausing all operations for {backoff:.0f}s..."
+                            )
+                            _was_network_degraded = True
+                        else:
+                            logger.warning(
+                                f"   ↩️ Still offline — retrying in {backoff:.0f}s "
+                                f"(failure #{consecutive_scan_failures})"
+                            )
+                        await asyncio.sleep(backoff)
+                    continue  # Skip sync/strategies this cycle
+
+                # Network is healthy — reset circuit breaker
+                if _was_network_degraded:
+                    logger.info("✅ Network restored. Resuming operations.")
+                    _was_network_degraded = False
+                consecutive_scan_failures = 0
+                manager.network_degraded = False
+                manager.shared_fx_rate = current_fx
 
                 # 0. Sync Capacity & Snapshot
                 await manager.sync_capacity()

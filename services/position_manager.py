@@ -44,7 +44,6 @@ class PositionManager:
             }
         )
         self.BATCH_SIZE_USDT = 100.0
-        self.MAX_POSITIONS = 1
         self.rule_manager = RuleManager(spot_clients=self.spot_clients)
         self.rules = {}
         self.shutdown_event = shutdown_event
@@ -52,12 +51,26 @@ class PositionManager:
         self.locks = {}
         self.thresholds = thresholds or {}
         self.shared_fx_rate = 0.0
-        self.MIN_TRADE_VALUE_KRW = 5000.0
+        self.MIN_TRADE_VALUE_KRW = 6000.0
         self.leverage_cache = set()
+        self.network_degraded = False  # Set by main loop circuit breaker
+        self._locked_funds_last_seen: dict = (
+            {}
+        )  # symbol -> event_loop time of last LOCKED FUNDS
+        self._binance_hedge_cache: dict = (
+            {}
+        )  # b_sym -> contracts; updated by sync_positions
+        self._loss_exit_cooldown: dict = (
+            {}
+        )  # "symbol:exch" -> event_loop time of last net-loss exit; blocks re-entry for 15 min
+        self._maxhold_warned: set = (
+            set()
+        )  # "symbol:exch" keys already warned about MAX_HOLD; suppresses per-cycle log spam
+        self.MAX_HOLD_HOURS = 48  # Force-exit any position held longer than this
 
         asyncio.create_task(self._ensure_binance_hedge_mode())
 
-    def adjust_price_to_tick(self, price: float) -> float:
+    def adjust_price_to_tick(self, price: float, ceil: bool = False) -> float:
         if price >= 2_000_000:
             tick = 1000
         elif price >= 1_000_000:
@@ -84,7 +97,10 @@ class PositionManager:
             tick = 0.001
         else:
             tick = 0.0001
-        adjusted = math.floor(price / tick) * tick
+        # BUY orders: floor (bid at or below market)
+        # SELL orders: ceil (limit sell at or above the computed floor price)
+        rounder = math.ceil if ceil else math.floor
+        adjusted = rounder(price / tick) * tick
         if tick >= 1:
             return int(adjusted)
         else:
@@ -104,21 +120,29 @@ class PositionManager:
     async def _safe_close_hedge(self, symbol_slash: str, qty: float):
         """
         Safely closes a SHORT position in Hedge Mode.
-        Swallows errors if the position is already closed/zero.
+        Do NOT include reduceOnly in params at all — Binance rejects it with -1106 in
+        Hedge Mode even when set to False. Direction is set by positionSide=SHORT alone.
         """
         try:
-            # [FIX] Do NOT send reduceOnly in Hedge Mode. Just use positionSide.
             await self.binance.create_market_buy_order(
-                symbol=symbol_slash, amount=qty, params={"positionSide": "SHORT"}
+                symbol=symbol_slash,
+                amount=qty,
+                params={"positionSide": "SHORT"},
             )
             return True, None, None
         except Exception as e:
             e_str = str(e)
-            # If rejected because position is zero/closed, treat as success
+            # -2022 in Hedge Mode means position is already at 0 (nothing to close).
+            # "Order's notional" means remaining qty is below Binance's minimum (dust).
+            # Both mean the short is effectively gone — treat as success.
             if "-2022" in e_str or "ReduceOnly" in e_str or "Order's notional" in e_str:
-                logger.warning(f"   ⚠️ Hedge Close Skipped (Likely already 0): {e_str}")
+                logger.warning(
+                    f"   ⚠️ Hedge Close Skipped (position already 0 or dust): {e_str}"
+                )
                 return True, 0.0, "already_closed"
-            logger.error(f"   ❌ _safe_close_hedge FAILED: {symbol_slash} qty={qty} | {e_str}")
+            logger.error(
+                f"   ❌ _safe_close_hedge FAILED: {symbol_slash} qty={qty} | {e_str}"
+            )
             return False, 0.0, str(e)
 
     # --- [FIX] NEW LEVERAGE HELPER ---
@@ -165,6 +189,7 @@ class PositionManager:
     def get_kst_now(self):
         return datetime.now(timezone(timedelta(hours=9))).replace(tzinfo=None)
 
+
     async def close(self):
         if self.binance:
             await self.binance.close()
@@ -177,25 +202,38 @@ class PositionManager:
         all_opps = []
         for coin, exchanges in market_data.items():
             for exch, data in exchanges.items():
-                if exch in ("UPBIT", "COINONE"):  # taker path handles these
+                if exch == "COINONE":  # Coinone entries disabled
                     continue
                 threshold = self.thresholds.get(exch, {}).get("ENTRY", -0.5)
                 if data["entry_premium"] > threshold:
                     continue
                 if not data.get("valid_liquidity", False):
                     continue
+                VELOCITY_ENTRY_CUTOFF = -0.15  # skip if premium dropped >0.15%/scan
+                if data.get("entry_premium_velocity", 0.0) < VELOCITY_ENTRY_CUTOFF:
+                    continue  # Premium still deteriorating; wait for stabilization
                 all_opps.append(data)
 
         all_opps.sort(key=lambda x: x["entry_premium"])
 
         # 2. Capacity Check
         active_positions = self.get_active_positions()
-        current_global_count = len(active_positions)
-
         active_symbols = {p.symbol for p in active_positions}
 
+        bithumb_slots = self.exchange_slots.get("BITHUMB", 0)
+        upbit_slots = self.exchange_slots.get("UPBIT", 0)
+        if not all_opps:
+            logger.debug(
+                f"   📊 Maker: No opportunities (threshold not met or low liquidity). "
+                f"BITHUMB slots={bithumb_slots}, UPBIT slots={upbit_slots}"
+            )
+        elif bithumb_slots <= 0 and upbit_slots <= 0:
+            logger.info(
+                f"   📊 Maker: {len(all_opps)} opp(s) found but slots=0 on all maker exchanges (insufficient KRW)."
+            )
+
         # 3. Batch Firing Loop
-        while current_global_count < self.MAX_POSITIONS:
+        while True:
             batch = []
             # Strict per-batch limits to ensure 1s spacing isn't wasted
             # Default limits per exchange (can be customized)
@@ -219,12 +257,14 @@ class PositionManager:
                     continue
                 if batch_counts[exch] >= limits.get(exch, 4):
                     continue
+                # Skip if this coin had a recent loss exit (15-min cool-off)
+                if asyncio.get_event_loop().time() - self._loss_exit_cooldown.get(f"{symbol}:{exch}", 0) < 900:
+                    continue
 
                 batch.append(opp)
                 active_symbols.add(symbol)
                 self.exchange_slots[exch] -= 1
                 batch_counts[exch] += 1
-                current_global_count += 1
                 all_opps.remove(opp)
 
                 if len(batch) >= 10:
@@ -278,7 +318,62 @@ class PositionManager:
                 self.exchange_slots[opp["spot_exchange"]] += 1  # Refund slot
                 return None
 
-        tasks = [place_wrapper(o) for o in batch_opps]
+        # Pre-check: cap the batch to what each exchange can actually afford right now.
+        # This prevents insufficient_funds rejections when firing orders in parallel.
+        from collections import defaultdict
+
+        grouped: dict = defaultdict(list)
+        for opp in batch_opps:
+            grouped[opp["spot_exchange"]].append(opp)
+
+        affordable: list = []
+        all_skipped: list = []  # (symbol, exch, order_cost_krw)
+        for exch, opps in grouped.items():
+            client = self.spot_clients[exch]
+            try:
+                bal = await client.fetch_balance()
+                free_krw = bal.get("KRW", {}).get("free", 0.0)
+                ref_fx = opps[0].get("ref_fx") or self.shared_fx_rate
+                # Add 5% buffer to account for qty rounding (apply_precision can round
+                # up, making the actual order cost slightly higher than the estimate).
+                order_cost_krw = self.BATCH_SIZE_USDT * ref_fx * 1.05
+                max_can_place = (
+                    int(free_krw / order_cost_krw) if order_cost_krw > 0 else 0
+                )
+
+                can_place = opps[:max_can_place]
+                cant_place = opps[max_can_place:]
+
+                for o in cant_place:
+                    self.exchange_slots[exch] += 1  # Refund slot
+                    all_skipped.append((o["symbol"], exch, order_cost_krw))
+                    logger.info(
+                        f"   💰 {o['symbol']} ({exch}) skipped: "
+                        f"only {free_krw:,.0f} KRW free, need ~{order_cost_krw:,.0f} per order "
+                        f"({max_can_place}/{len(opps)} affordable)"
+                    )
+
+                affordable.extend(can_place)
+            except Exception as e:
+                logger.error(
+                    f"   ❌ Pre-check balance fetch failed for {exch}: {e}. Skipping batch."
+                )
+                for o in opps:
+                    self.exchange_slots[exch] += 1  # Refund all slots
+
+        if all_skipped:
+            total_needed = sum(cost for _, _, cost in all_skipped)
+            syms = ", ".join(f"{s}" for s, _, _ in all_skipped)
+            logger.info(
+                f"   💰 SKIPPED {len(all_skipped)} order(s) this cycle ({syms}) - "
+                f"add ~{total_needed:,.0f} KRW ({total_needed / self.shared_fx_rate:,.0f} USDT) "
+                f"to cover all skipped"
+            )
+
+        if not affordable:
+            return
+
+        tasks = [place_wrapper(o) for o in affordable]
         results = await asyncio.gather(*tasks)
         orders_info = [r for r in results if r is not None]
 
@@ -298,7 +393,7 @@ class PositionManager:
         """
         active_orders = {o["id"]: o for o in orders}
         monitor_start = asyncio.get_event_loop().time()
-        MAX_LIFE = 10  # seconds
+        MAX_LIFE = 20  # seconds (raised from 10 to reduce cancel/fill races = ZOMBIE events)
 
         try:
             while active_orders:
@@ -843,82 +938,100 @@ class PositionManager:
             target_pct = self.thresholds.get(pos.exchange, {}).get("EXIT", 1.5)
             scaling = 1000.0 if b_key.startswith("1000") else 1.0
 
-            floor_price = (
-                (bin_ask / scaling) * self.shared_fx_rate * (1 + target_pct / 100.0)
+            bin_ask_unit = bin_ask / scaling
+            # Use the higher floor: entry-based (prevents early exit when Binance
+            # drops) vs current-Binance-based (adapts upward when Binance rises).
+            entry_floor = (
+                (pos.entry_hedge_price or bin_ask_unit)
+                * self.shared_fx_rate
+                * (1 + target_pct / 100.0)
             )
+            current_floor = bin_ask_unit * self.shared_fx_rate * (1 + target_pct / 100.0)
+            floor_price = max(entry_floor, current_floor)
 
             try:
                 s_book = await client.fetch_orderbook(pos.symbol)
+                s_best_bid = s_book["bid"]
                 s_best_ask = s_book["ask"]
             except:
                 return
 
-            final_price = max(floor_price, s_best_ask)
-            final_price = self.adjust_price_to_tick(final_price)
+            if not s_best_bid or s_best_bid < floor_price:
+                # Bid hasn't reached our exit threshold yet.
+                # The background exit loop handles maker orders at floor_price.
+                return
 
-            if final_price <= s_best_ask:
-                qty = self.apply_precision(
-                    pos.symbol, min(pos.current_spot_qty, free), pos.exchange
+            # Spot bid meets exit threshold → taker sell at bid for immediate fill
+            final_price = self.adjust_price_to_tick(s_best_bid)
+
+            qty = self.apply_precision(
+                pos.symbol, min(pos.current_spot_qty, free), pos.exchange
+            )
+            if (qty * final_price) < 6000:
+                return
+
+            try:
+                logger.info(
+                    f"   💰 Exit Attempt {pos.symbol}: Taker @ {final_price} (floor: {floor_price:.1f})"
                 )
-                if (qty * final_price) < 5000:
-                    return
+                res = await client.create_limit_sell_order(pos.symbol, final_price, qty)
+                order_id = res.get("id") or res.get("uuid")
 
-                try:
-                    logger.info(f"   💰 Exit Attempt {pos.symbol}: Limit {final_price}")
-                    res = await client.create_limit_sell_order(
-                        pos.symbol, final_price, qty
+                await asyncio.sleep(5.0)
+
+                await client.cancel_order(order_id, pos.symbol)
+                final_status = await client.fetch_order(order_id, pos.symbol)
+                filled = float(final_status.get("filled", 0.0))
+
+                if filled > 0:
+                    ratio = (
+                        filled / pos.current_spot_qty if pos.current_spot_qty > 0 else 0
                     )
-                    order_id = res.get("id") or res.get("uuid")
-
-                    await asyncio.sleep(5.0)
-
-                    await client.cancel_order(order_id, pos.symbol)
-                    final_status = await client.fetch_order(order_id, pos.symbol)
-                    filled = float(final_status.get("filled", 0.0))
-
-                    if filled > 0:
-                        ratio = (
-                            filled / pos.current_spot_qty
-                            if pos.current_spot_qty > 0
-                            else 0
+                    h_qty = self.apply_precision(
+                        pos.symbol,
+                        pos.current_hedge_qty * ratio,
+                        pos.exchange,
+                        is_binance=True,
+                    )
+                    ex_price = None
+                    hedge_close_ok_active = True
+                    if h_qty <= 0:
+                        logger.critical(
+                            f"   ☠️ HEDGE SKIP: {pos.symbol} h_qty=0 "
+                            f"(DB current_hedge_qty={pos.current_hedge_qty:.4f}). "
+                            f"Will retry automatically via sync_orphan_hedges."
                         )
-                        h_qty = self.apply_precision(
-                            pos.symbol,
-                            pos.current_hedge_qty * ratio,
-                            pos.exchange,
-                            is_binance=True,
+                        hedge_close_ok_active = False
+                    else:
+                        h_success, ex_price, _ = await self._safe_close_hedge(
+                            f"{b_key}/USDT", h_qty
                         )
-                        ex_price = None
-                        if h_qty <= 0:
+                        if not h_success:
                             logger.critical(
-                                f"   ☠️ HEDGE SKIP: {pos.symbol} h_qty=0 "
-                                f"(DB current_hedge_qty={pos.current_hedge_qty:.4f}). "
-                                f"Check Binance for open {b_key} SHORT and close manually!"
+                                f"   ☠️ HEDGE CLOSE FAILED: {pos.symbol} | "
+                                f"Tried {b_key}/USDT qty={h_qty:.4f}. "
+                                f"Will retry automatically via sync_orphan_hedges."
                             )
-                        else:
-                            h_success, ex_price, _ = await self._safe_close_hedge(
-                                f"{b_key}/USDT", h_qty
-                            )
-                            if not h_success:
-                                logger.critical(
-                                    f"   ☠️ HEDGE CLOSE FAILED: {pos.symbol} | "
-                                    f"Tried {b_key}/USDT qty={h_qty:.4f}. "
-                                    f"Spot SOLD but Binance SHORT still open — manual close required!"
-                                )
-                        self._finalize_db_exit(
-                            pos,
-                            filled,
-                            final_price,
-                            h_qty,
-                            ex_price or (bin_ask / scaling),
-                        )
-                except Exception as e:
-                    logger.error(f"   ⚠️ Exit Error {pos.symbol}: {e}")
+                            hedge_close_ok_active = False
+                    self._finalize_db_exit(
+                        pos,
+                        filled,
+                        final_price,
+                        h_qty,
+                        ex_price or (bin_ask / scaling),
+                        hedge_ok=hedge_close_ok_active,
+                        exit_reason="ACTIVE_TAKER",
+                    )
+            except Exception as e:
+                logger.error(f"   ⚠️ Exit Error {pos.symbol}: {e}")
 
-    def _finalize_db_exit(self, pos, s_qty, s_price, h_qty, h_price):
+    def _finalize_db_exit(
+        self, pos, s_qty, s_price, h_qty, h_price, hedge_ok=True, exit_reason="NORMAL"
+    ):
         """
         Updates the Position in DB with exit details, calculating PnL for this specific batch
         and accumulating it into the total position stats. Handles partial exits correctly.
+        When hedge_ok=False, current_hedge_qty is NOT zeroed so sync_orphan_hedges can retry.
         """
         try:
             with SessionLocal() as db:
@@ -1014,12 +1127,30 @@ class PositionManager:
                 if db_pos.current_spot_qty < (db_pos.entry_spot_qty * 0.01):
                     db_pos.status = "CLOSED"
                     db_pos.current_spot_qty = 0
-                    db_pos.current_hedge_qty = 0
+                    if hedge_ok:
+                        db_pos.current_hedge_qty = 0
+                    # If hedge_ok is False, keep current_hedge_qty non-zero
+                    # so sync_orphan_hedges() can detect and retry closing the Binance short.
+                    db_pos.exit_reason = "HEDGE_FAILED" if not hedge_ok else exit_reason
+
+                    # Record loss cool-off so the same coin isn't re-entered immediately
+                    if (db_pos.net_pnl_usdt or 0.0) < -0.10:
+                        cooldown_key = f"{pos.symbol}:{pos.exchange}"
+                        self._loss_exit_cooldown[cooldown_key] = asyncio.get_event_loop().time()
+                        logger.info(
+                            f"   ⏳ Loss cool-off: {pos.symbol}/{pos.exchange} — 15 min before re-entry"
+                        )
 
                     # Final Log
-                    logger.info(
-                        f"   🏁 TRADE CLOSED: {pos.symbol} | 💰 NET PNL: ${db_pos.net_pnl_usdt:.2f}"
-                    )
+                    if hedge_ok:
+                        logger.info(
+                            f"   🏁 TRADE CLOSED: {pos.symbol} | 💰 NET PNL: ${db_pos.net_pnl_usdt:.2f}"
+                        )
+                    else:
+                        logger.warning(
+                            f"   🏁 TRADE CLOSED (SPOT ONLY): {pos.symbol} | NET PNL: ${db_pos.net_pnl_usdt:.2f} "
+                            f"| Binance SHORT still open — will retry automatically"
+                        )
                 else:
                     logger.info(
                         f"   📉 PARTIAL EXIT: {pos.symbol} | Batch Net: ${batch_net_pnl:.2f} | Rem Spot: {db_pos.current_spot_qty:.4f}"
@@ -1036,6 +1167,19 @@ class PositionManager:
         Now relies on shared_fx_rate being updated by the main loop.
         """
         self.rules = self.rule_manager.get_rules_map()
+
+        # Hot-reload BATCH_SIZE_USDT from bot_config.json each cycle.
+        try:
+            with open("bot_config.json", "r") as _cfg_f:
+                _cfg = json.load(_cfg_f)
+            new_batch = float(_cfg.get("SYSTEM", {}).get("BATCH_SIZE_USDT", 100.0))
+            if new_batch != self.BATCH_SIZE_USDT:
+                logger.info(
+                    f"   🔄 BATCH_SIZE_USDT updated: {self.BATCH_SIZE_USDT:.0f} → {new_batch:.0f} USDT"
+                )
+                self.BATCH_SIZE_USDT = new_batch
+        except Exception:
+            pass
 
         if self.shared_fx_rate <= 0:
             # logger.warning("   ⚠️ sync_capacity: No FX rate yet. Skipping slot calculation.")
@@ -1076,12 +1220,6 @@ class PositionManager:
 
         except Exception as e:
             logger.error(f"   ⚠️ Capacity Sync Error: {e}")
-        try:
-            b_bal = await self.binance.fetch_balance()
-            usdt_total = float(b_bal["USDT"]["total"])
-            self.MAX_POSITIONS = int(usdt_total / self.BATCH_SIZE_USDT)
-        except:
-            self.MAX_POSITIONS = 0
 
     async def sync_positions(self):
         """Reconciles DB state with actual wallet balances (Thread-Safe)."""
@@ -1098,6 +1236,8 @@ class PositionManager:
                 b_position_map = {
                     p["symbol"]: float(p["contracts"]) for p in b_positions
                 }
+                # Cache for orphan-short detection used by entry logic
+                self._binance_hedge_cache = b_position_map
 
                 spot_balances = {}
                 for name, client in self.spot_clients.items():
@@ -1156,6 +1296,7 @@ class PositionManager:
                             if success:
                                 pos.status = "CLOSED"
                                 pos.exit_time = self.get_kst_now()
+                                pos.exit_reason = "GHOST_SELL"
                                 pos.current_spot_qty = 0
                                 pos.current_hedge_qty = 0
                                 db.commit()
@@ -1165,11 +1306,14 @@ class PositionManager:
                             continue
 
                         # 2. NORMAL SYNC (Update DB to match Reality)
+                        # Cap at entry_spot_qty: orphan coins from other positions sharing
+                        # the same symbol (e.g. a failed exit from a previous position) must
+                        # not inflate current_spot_qty beyond what was actually entered.
                         changed = False
                         if abs(pos.current_spot_qty - real_spot_qty) > (
                             pos.current_spot_qty * 0.05
                         ):
-                            pos.current_spot_qty = real_spot_qty
+                            pos.current_spot_qty = min(real_spot_qty, pos.entry_spot_qty)
                             changed = True
 
                         if abs(pos.current_hedge_qty - real_binance_qty) > (
@@ -1183,6 +1327,106 @@ class PositionManager:
 
         except Exception as e:
             logger.error(f"💥 Failed to sync positions: {e}")
+
+        # After normal sync: retry any Binance shorts that failed to close previously
+        await self.sync_orphan_hedges()
+
+    async def sync_orphan_hedges(self):
+        """
+        Retries closing Binance SHORT positions for trades that were fully spot-exited
+        but whose hedge close failed (status=CLOSED, current_hedge_qty > 0).
+        This prevents orphan Binance shorts from accumulating across restarts.
+        """
+        try:
+            with SessionLocal() as db:
+                orphans = (
+                    db.query(Position)
+                    .filter(
+                        Position.status == "CLOSED",
+                        Position.current_hedge_qty > 0,
+                    )
+                    .all()
+                )
+
+            if not orphans:
+                return
+
+            from services.hedger import SYMBOL_MAP
+
+            inv_map = {v: k for k, v in SYMBOL_MAP.items()}
+
+            for pos in orphans:
+                b_key = inv_map.get(pos.symbol, pos.symbol)
+                b_sym_slash = f"{b_key}/USDT"
+
+                # Use the cache updated earlier in sync_positions to determine the actual
+                # Binance qty. If the position is already at 0, skip the API call entirely
+                # (avoids misinterpreting -2022 as a real error vs. "nothing to close").
+                actual_qty = 0.0
+                for b_sym_candidate in (f"{b_key}/USDT", f"{b_key}/USDT:USDT"):
+                    q = self._binance_hedge_cache.get(b_sym_candidate, 0)
+                    if q > 0:
+                        actual_qty = q
+                        break
+
+                if actual_qty <= 0:
+                    # Already closed on Binance (externally or on a prior retry) — just clean DB
+                    with SessionLocal() as db:
+                        db_pos = db.query(Position).get(pos.id)
+                        if db_pos:
+                            db_pos.current_hedge_qty = 0
+                            db.commit()
+                    logger.info(
+                        f"   ✅ Orphan hedge already 0 on Binance: {pos.symbol}"
+                    )
+                    continue
+
+                logger.warning(
+                    f"   🔁 Orphan hedge retry: {pos.symbol} | "
+                    f"Closing {actual_qty:.4f} contracts on Binance"
+                )
+                success, ex_price, _ = await self._safe_close_hedge(
+                    b_sym_slash, actual_qty
+                )
+                if success:
+                    with SessionLocal() as db:
+                        db_pos = db.query(Position).get(pos.id)
+                        if db_pos:
+                            db_pos.current_hedge_qty = 0
+
+                            # Correct PnL: original exit recorded wrong exit_hedge_price (0 or estimate).
+                            # Now we have the actual close price — apply delta correction.
+                            if ex_price and ex_price > 0 and db_pos.entry_hedge_price:
+                                old_exit_price = db_pos.exit_hedge_price or 0.0
+                                pnl_correction = (
+                                    old_exit_price - ex_price
+                                ) * actual_qty
+                                db_pos.gross_hedge_pnl_usdt = (
+                                    db_pos.gross_hedge_pnl_usdt or 0.0
+                                ) + pnl_correction
+                                db_pos.net_pnl_usdt = (
+                                    db_pos.net_pnl_usdt or 0.0
+                                ) + pnl_correction
+                                db_pos.exit_hedge_price = ex_price
+                                db_pos.exit_hedge_amount_usdt = actual_qty * ex_price
+                                logger.info(
+                                    f"   ✅ Orphan hedge closed: {pos.symbol} @ {ex_price:.4f} "
+                                    f"| PnL correction: ${pnl_correction:+.2f}"
+                                )
+                            else:
+                                logger.info(
+                                    f"   ✅ Orphan hedge closed: {pos.symbol} (no price correction available)"
+                                )
+
+                            db.commit()
+                else:
+                    logger.error(
+                        f"   ❌ Orphan hedge still failing: {pos.symbol} — "
+                        f"check Binance {b_key} SHORT manually"
+                    )
+
+        except Exception as e:
+            logger.error(f"   ⚠️ sync_orphan_hedges error: {e}")
 
     def get_active_positions(self):
         with SessionLocal() as db:
@@ -1210,12 +1454,9 @@ class PositionManager:
 
         all_opps.sort(key=lambda x: x["entry_premium"])
         active_positions = self.get_active_positions()
-        current_global_count = len(active_positions)
         active_symbols = {p.symbol for p in active_positions}
 
         for opp in all_opps:
-            if current_global_count >= self.MAX_POSITIONS:
-                break
             symbol = opp["symbol"]
             if symbol in active_symbols:
                 continue
@@ -1235,12 +1476,13 @@ class PositionManager:
 
                 success = await self._attempt_snipe(opp)
                 if success:
-                    current_global_count += 1
                     active_symbols.add(symbol)
                     self.exchange_slots[exch] -= 1
 
     # --- [LEG 1b] IOC TAKER STRATEGY (Upbit + Coinone) ---
-    _TAKER_EXCHANGES = {"UPBIT", "COINONE"}
+    _TAKER_EXCHANGES = (
+        set()
+    )  # Taker path disabled; Upbit now uses maker, Coinone entries stopped
 
     async def execute_taker_strategy(self, market_data: Dict):
         """IOC entry at ask price for Upbit and Coinone."""
@@ -1254,16 +1496,16 @@ class PositionManager:
                     continue
                 if not data.get("valid_liquidity", False):
                     continue
+                VELOCITY_ENTRY_CUTOFF = -0.15  # skip if premium dropped >0.15%/scan
+                if data.get("entry_premium_velocity", 0.0) < VELOCITY_ENTRY_CUTOFF:
+                    continue  # Premium still deteriorating; wait for stabilization
                 all_opps.append(data)
 
         all_opps.sort(key=lambda x: x.get("entry_premium_ask", 0))
         active_positions = self.get_active_positions()
-        current_global_count = len(active_positions)
         active_symbols = {p.symbol for p in active_positions}
 
         for opp in all_opps:
-            if current_global_count >= self.MAX_POSITIONS:
-                break
             symbol = opp["symbol"]
             exch = opp["spot_exchange"]
             if symbol in active_symbols:
@@ -1281,7 +1523,6 @@ class PositionManager:
                     continue
                 success = await self._attempt_snipe(opp)
                 if success:
-                    current_global_count += 1
                     active_symbols.add(symbol)
                     self.exchange_slots[exch] -= 1
 
@@ -1309,13 +1550,39 @@ class PositionManager:
                         db.query(Position)
                         .filter(
                             Position.symbol == symbol,
-                            Position.spot_exchange == exchange,
+                            Position.exchange == exchange,
                             Position.status == "OPEN",
                         )
                         .first()
                     )
                     if not exists:
                         return True
+
+            # Also block entry if there is an orphan Binance short for this symbol
+            # (a short with no matching OPEN DB position — left over from a failed hedge close).
+            from services.hedger import SYMBOL_MAP
+
+            inv_map_local = {v: k for k, v in SYMBOL_MAP.items()}
+            b_key = inv_map_local.get(symbol, symbol)
+            for b_sym in (f"{b_key}/USDT", f"{b_key}/USDT:USDT"):
+                orphan_qty = self._binance_hedge_cache.get(b_sym, 0)
+                if orphan_qty > 0.001:
+                    with SessionLocal() as db:
+                        covered = (
+                            db.query(Position)
+                            .filter(
+                                Position.symbol == symbol,
+                                Position.status == "OPEN",
+                            )
+                            .first()
+                        )
+                    if not covered:
+                        logger.warning(
+                            f"   ⚠️ Orphan Binance SHORT: {b_sym} qty={orphan_qty:.4f} "
+                            f"(no OPEN DB position). Blocking {symbol} entry."
+                        )
+                        return True
+
             return False
         except:
             return True
@@ -1479,10 +1746,40 @@ class PositionManager:
 
         # --- FINALIZATION ---
         try:
-            # If still not filled after 4 loops or abort
+            # If the chase loop exited without a confirmed fill (e.g. "else: break" after
+            # a timeout where premium was still acceptable), cancel the pending limit order
+            # and capture any partial fill. If there are no fills at all, raise so the
+            # rollback handler can unwind the spot leg cleanly.
             if not is_filled:
-                # Same logic as before but using cumulative tracker inside the helper
-                pass  # The exception handler below will catch the state
+                if current_order_id:
+                    try:
+                        await self.binance.cancel_order(current_order_id, bin_sym)
+                    except Exception:
+                        pass  # Already filled or already cancelled — handled below
+
+                    try:
+                        cancel_status = await self.binance.fetch_order(
+                            current_order_id, bin_sym
+                        )
+                        partial_fill = float(cancel_status.get("filled", 0.0))
+                        if partial_fill > 0:
+                            cumulative_hedge_filled = partial_fill
+                            final_hedge_res = cancel_status
+                            hedge_qty = partial_fill
+                            is_filled = True
+                            logger.warning(
+                                f"   ⚠️ {symbol} hedge timed out; captured partial fill {partial_fill:.4f}"
+                            )
+                        else:
+                            raise Exception(
+                                f"Hedge order {current_order_id} cancelled with 0 fills — rolling back."
+                            )
+                    except Exception as inner_e:
+                        raise inner_e
+                else:
+                    raise Exception(
+                        "No hedge order ID and is_filled=False — rolling back."
+                    )
 
             # [REMOVED OLD PANIC LOGIC HERE, NOW HANDLED BY HELPER OR SUCCESS]
 
@@ -1640,6 +1937,12 @@ class PositionManager:
             if free_qty >= required_qty:
                 return free_qty
             if total_qty >= required_qty and free_qty < required_qty:
+                # Cooldown: only cancel once per 60s per symbol to avoid spamming
+                # the exchange API with cancel requests every loop cycle.
+                now = asyncio.get_event_loop().time()
+                if now - self._locked_funds_last_seen.get(pos.symbol, 0) < 60.0:
+                    return None  # Cancel already dispatched recently; wait
+                self._locked_funds_last_seen[pos.symbol] = now
                 logger.warning(
                     f"   🔒 LOCKED FUNDS: {pos.symbol}. Cancelling open orders..."
                 )
@@ -1662,16 +1965,28 @@ class PositionManager:
             if not open_orders:
                 return
 
-            # [IMPROVEMENT] Log the action
-            logger.info(
-                f"   🔓 Releasing {len(open_orders)} locked orders for {symbol}..."
-            )
+            # Only cancel BUY (entry) orders. SELL orders are active exit attempts
+            # placed by run_active_exit — cancelling them causes a firesell when the
+            # bot immediately re-places them at the new (potentially worse) market price.
+            buy_orders = [
+                o
+                for o in open_orders
+                if str(o.get("side", "")).lower() in ("bid", "buy")
+            ]
 
-            for order in open_orders:
+            if not buy_orders:
+                logger.debug(
+                    f"   🔓 {symbol}: locked funds are in a SELL order (exit in progress) — leaving intact."
+                )
+                return
+
+            logger.info(
+                f"   🔓 Releasing {len(buy_orders)} locked BUY order(s) for {symbol}..."
+            )
+            for order in buy_orders:
                 await client.cancel_order(order["id"], symbol)
                 await asyncio.sleep(0.1)
         except Exception as e:
-            # [IMPROVEMENT] Log the error instead of 'pass'
             logger.error(f"   ⚠️ Failed to release funds for {symbol}: {e}")
 
     async def _manage_single_exit(self, pos: Position, bin_map: Dict):
@@ -1688,6 +2003,21 @@ class PositionManager:
                 return
 
             threshold = self.thresholds.get(exch, {}).get("EXIT", 0.0)
+
+            hold_hours = (
+                (self.get_kst_now() - pos.entry_time).total_seconds() / 3600
+                if pos.entry_time is not None
+                else 0.0
+            )
+
+            # --- GRADUAL EXIT THRESHOLD DECAY ---
+            # After 12h hold, lower the exit floor by 0.1% per 6 additional hours
+            # (max reduction: 0.7%). This lets stuck positions exit sooner at a
+            # smaller loss rather than sitting until the hard 48h MAX_HOLD cliff.
+            if hold_hours > 12:
+                decay = min(0.7, ((hold_hours - 12) / 6) * 0.1)
+                threshold = round(threshold - decay, 4)
+
             from services.hedger import SYMBOL_MAP
 
             inv_map = {v: k for k, v in SYMBOL_MAP.items()}
@@ -1701,12 +2031,73 @@ class PositionManager:
 
             bin_ask_unit = bin_ask / scaling
             ref_fx = self.shared_fx_rate
-            raw_target = bin_ask_unit * ref_fx * (1 + threshold / 100.0)
-            target_spot_price_krw = self.adjust_price_to_tick(raw_target)
+
+            # Floor is the HIGHER of:
+            #   (a) entry-based floor  — locks in minimum profit relative to the hedge
+            #       price we actually paid; prevents immediate exit when Binance drops
+            #       sharply after entry (the position should wait for spot to recover).
+            #   (b) current-Binance floor — adapts upward when Binance rises, so we
+            #       don't exit too cheaply in a rising-Binance environment.
+            entry_based_target = (
+                (pos.entry_hedge_price or bin_ask_unit) * ref_fx * (1 + threshold / 100.0)
+            )
+            current_based_target = bin_ask_unit * ref_fx * (1 + threshold / 100.0)
+            raw_target = max(entry_based_target, current_based_target)
+            target_spot_price_krw = self.adjust_price_to_tick(raw_target, ceil=True)
+
+            # --- ASK PRICE FLOOR (decay window: 12h–48h) ---
+            # If the threshold-based floor is below the current spot ask, snap it up
+            # to the ask so we never undercut the market during the decay window.
+            if 12 < hold_hours <= self.MAX_HOLD_HOURS:
+                try:
+                    ask_client = self.spot_clients.get(exch)
+                    if ask_client:
+                        s_book = await ask_client.fetch_orderbook(symbol)
+                        s_ask = s_book.get("ask", 0)
+                        if s_ask > 0:
+                            ask_tick = self.adjust_price_to_tick(s_ask, ceil=True)
+                            if ask_tick > target_spot_price_krw:
+                                logger.debug(
+                                    f"   📈 Ask-floor: {symbol} sell floor "
+                                    f"{target_spot_price_krw:,.0f} → {ask_tick:,.0f} KRW (ask)"
+                                )
+                                target_spot_price_krw = ask_tick
+                except Exception as e:
+                    logger.debug(
+                        f"   ℹ️ Ask-floor fetch failed for {symbol}: {e} — using threshold price"
+                    )
+
+            # --- MAX HOLD TIME: force-exit at ask if held too long ---
+            force_exit = False
+            if hold_hours > self.MAX_HOLD_HOURS:
+                force_exit = True
+                warn_key = f"{symbol}:{exch}"
+                if warn_key not in self._maxhold_warned:
+                    self._maxhold_warned.add(warn_key)
+                    logger.warning(
+                        f"   ⏰ MAX HOLD EXCEEDED: {symbol} held {hold_hours:.1f}h "
+                        f"(limit={self.MAX_HOLD_HOURS}h). Force-exiting at ask (retrying each cycle)."
+                    )
+                else:
+                    logger.debug(
+                        f"   ⏰ Force-exit retry: {symbol}/{exch} at {hold_hours:.1f}h"
+                    )
+                try:
+                    tmp_client = self.spot_clients.get(exch)
+                    if tmp_client:
+                        s_book = await tmp_client.fetch_orderbook(symbol)
+                        s_ask = s_book.get("ask", 0)
+                        if s_ask > 0:
+                            target_spot_price_krw = self.adjust_price_to_tick(s_ask)
+                except Exception as e:
+                    logger.warning(
+                        f"   ⚠️ Force-exit orderbook fetch failed for {symbol}: {e}"
+                    )
 
             client = self.spot_clients.get(exch)
 
-            # Use 'current_spot_qty' from DB for logic
+            # Use full wallet balance so no dust remains after exit.
+            # Any orphan coins from a failed DB write are also swept out here.
             safe_qty = wallet_free_qty
             if exch == "BITHUMB":
                 safe_qty -= 0.00000002
@@ -1731,8 +2122,15 @@ class PositionManager:
                 if filled > 0:
                     logger.info(f"   🎉 EXIT FILLED: {symbol} Qty: {filled}")
 
-                    # Ratio based on ENTRY snapshot for hedge calculation
-                    denom = pos.entry_spot_qty if pos.entry_spot_qty > 0 else 1.0
+                    # Use CURRENT remaining qty as denominator so the final partial
+                    # batch (which sells everything left) gets ratio=1.0 and closes
+                    # 100% of remaining hedge. Using entry_qty would under-close
+                    # each batch and leave a growing residual on Binance.
+                    denom = (
+                        pos.current_spot_qty
+                        if pos.current_spot_qty > 0
+                        else (pos.entry_spot_qty or 1.0)
+                    )
                     ratio = min(1.0, filled / denom)
 
                     # [CRITICAL FIX] Use current_hedge_qty so that synced ghost shorts are fully closed
@@ -1767,6 +2165,7 @@ class PositionManager:
                             hedge_exit_id = ex_id or "safe_close"
                         else:
                             hedge_close_ok = False
+                            hedge_exit_price = bin_ask_unit  # Best-effort estimate; sync_orphan_hedges corrects later
                             logger.critical(
                                 f"   ☠️ HEDGE CLOSE FAILED: {symbol} | "
                                 f"Tried {b_sym_slash} qty={hedge_close_qty:.4f}. "
@@ -1826,11 +2225,34 @@ class PositionManager:
                         db_pos.exit_hedge_order_id = hedge_exit_id
 
                         # Update Status & State
-                        if filled >= (safe_qty * 0.98):
+                        # Close when remaining qty is below the KRW 5,000 minimum
+                        # trade size — it can't be sold anyway, so treat as dust.
+                        remaining_qty = pos.current_spot_qty - filled
+                        remaining_val_krw = remaining_qty * target_spot_price_krw
+                        if remaining_val_krw < self.MIN_TRADE_VALUE_KRW:
                             db_pos.status = "CLOSED"
                             db_pos.current_spot_qty = 0
-                            db_pos.current_hedge_qty = 0
+                            if hedge_close_ok:
+                                db_pos.current_hedge_qty = 0
+                            # If hedge_close_ok is False, keep current_hedge_qty non-zero
+                            # so sync_orphan_hedges() can detect and retry closing the short.
+                            db_pos.exit_reason = (
+                                "MAX_HOLD"
+                                if force_exit
+                                else (
+                                    "HEDGE_FAILED" if not hedge_close_ok else "NORMAL"
+                                )
+                            )
                             db.commit()
+                            if force_exit:
+                                self._maxhold_warned.discard(f"{symbol}:{exch}")
+                            # Record loss cool-off so the same coin isn't re-entered immediately
+                            if net_pnl < -0.10:  # type: ignore[operator]
+                                cooldown_key = f"{symbol}:{exch}"
+                                self._loss_exit_cooldown[cooldown_key] = asyncio.get_event_loop().time()
+                                logger.info(
+                                    f"   ⏳ Loss cool-off: {symbol}/{exch} — 15 min before re-entry"
+                                )
                             if hedge_close_ok:
                                 logger.info(
                                     f"   ✅ Trade Closed: {symbol} | Net PnL: ${net_pnl:.2f}"
@@ -1839,7 +2261,7 @@ class PositionManager:
                                 logger.warning(
                                     f"   ⚠️ Trade Closed (SPOT ONLY): {symbol} | "
                                     f"Net PnL: ${net_pnl:.2f} | "
-                                    f"*** Binance {b_key} SHORT was NOT closed — close manually! ***"
+                                    f"*** Binance {b_key} SHORT was NOT closed — will retry automatically ***"
                                 )
                         else:
                             db_pos.current_spot_qty -= filled

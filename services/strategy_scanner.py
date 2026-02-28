@@ -36,9 +36,8 @@ class StrategyScanner:
             "COINONE": {"ENTRY": -0.3, "EXIT": 0.7},
         }
 
-        self._reload_config()
-
-        self.BLACKLIST = [
+        # Static (hardcoded) blacklist — always blocked regardless of config
+        self._STATIC_BLACKLIST = [
             "HOLO",
             "SNT",
             "WAVES",
@@ -50,8 +49,18 @@ class StrategyScanner:
             "PAXG",
             "FIDA",
         ]
+        # Merged blacklist (static + dynamic from bot_config.json); updated by _reload_config
+        self.BLACKLIST = list(self._STATIC_BLACKLIST)
+
+        self._reload_config()
 
         self.SANITY_PREMIUM_LIMIT = -30.0
+
+        # Premium velocity tracking: stores previous scan's premium per (coin, exchange)
+        self._premium_history: dict = {}  # (coin, exchange_name) -> float
+
+        # Cache for Binance futures symbol list — reused when exchangeInfo call fails
+        self._valid_futures_cache: set = set()
 
     def _reload_config(self):
         try:
@@ -65,9 +74,17 @@ class StrategyScanner:
                 new_conf = json.load(f)
 
             for exch, values in new_conf.items():
+                if not isinstance(values, dict):
+                    continue  # Skip non-exchange keys (BLACKLIST list, etc.)
                 if exch not in self.THRESHOLDS:
                     self.THRESHOLDS[exch] = {}
                 self.THRESHOLDS[exch].update(values)
+
+            # Merge dynamic blacklist from config with the static hardcoded list
+            dyn_blacklist = new_conf.get("BLACKLIST", [])
+            self.BLACKLIST = list(set(self._STATIC_BLACKLIST) | set(dyn_blacklist))
+            if dyn_blacklist:
+                logger.info(f"   📋 Blacklist: {len(self.BLACKLIST)} coins ({len(dyn_blacklist)} dynamic)")
 
             self._last_config_mtime = mtime
             logger.info(f"   🔄 HOT RELOAD: Updated Thresholds from {self.CONFIG_FILE}")
@@ -102,9 +119,16 @@ class StrategyScanner:
             for s in exchange_info["symbols"]:
                 if s["status"] == "TRADING":
                     valid_futures.add(s["symbol"])
+            self._valid_futures_cache = valid_futures  # update cache on success
         except Exception as e:
-            logger.error(f"   ⚠️ Scanner Error (ExchangeInfo): {e}")
-            return {}, 0.0
+            if self._valid_futures_cache:
+                logger.warning(
+                    f"   ⚠️ Scanner Warning (ExchangeInfo): {e} — using cached symbol list ({len(self._valid_futures_cache)} symbols)"
+                )
+                valid_futures = self._valid_futures_cache
+            else:
+                logger.error(f"   ⚠️ Scanner Error (ExchangeInfo): {e}")
+                return {}, 0.0
 
         # --- 1. Fetch Binance Data ---
         try:
@@ -232,6 +256,13 @@ class StrategyScanner:
                     implied_fx_entry_ask = u_ask / b_bid_scaled
                     entry_premium_ask = ((implied_fx_entry_ask - ref_ask) / ref_ask) * 100
 
+                    # Velocity = change in entry_premium since last scan
+                    # Negative = premium worsening (falling); positive = premium improving
+                    prem_key = (coin, name)
+                    prev_premium = self._premium_history.get(prem_key)
+                    entry_premium_velocity = (entry_premium - prev_premium) if prev_premium is not None else 0.0
+                    self._premium_history[prem_key] = entry_premium
+
                     # Exit: We Sell Spot @ Ask, Buy Future @ Ask
                     implied_fx_exit = u_ask / b_ask_scaled
                     exit_premium = ((implied_fx_exit - ref_ask) / ref_ask) * 100
@@ -254,6 +285,7 @@ class StrategyScanner:
                         "spot_exchange": name,
                         "entry_premium": entry_premium,
                         "entry_premium_ask": entry_premium_ask,
+                        "entry_premium_velocity": entry_premium_velocity,
                         "exit_premium": exit_premium,
                         "spot_bid": u_bid,
                         "spot_ask": u_ask,

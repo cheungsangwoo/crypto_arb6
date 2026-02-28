@@ -112,6 +112,55 @@ def get_active_positions():
         return pd.read_sql(query, conn)
 
 
+def get_capital_events_in_window():
+    """Fetches capital deposits/withdrawals recorded in the last 24 hours."""
+    engine = get_db_engine()
+    try:
+        query = text(
+            """
+            SELECT timestamp, amount_krw, amount_usdt, fx_rate, notes
+            FROM capital_events
+            WHERE timestamp >= NOW() - INTERVAL 1 DAY
+            ORDER BY timestamp ASC
+        """
+        )
+        with engine.connect() as conn:
+            return pd.read_sql(query, conn)
+    except Exception:
+        return pd.DataFrame(columns=["timestamp", "amount_krw", "amount_usdt", "fx_rate", "notes"])
+
+
+def get_all_capital_events():
+    """Fetches all capital events (for the history table)."""
+    engine = get_db_engine()
+    try:
+        query = text(
+            """
+            SELECT timestamp, amount_krw, amount_usdt, fx_rate, notes
+            FROM capital_events
+            ORDER BY timestamp DESC
+            LIMIT 20
+        """
+        )
+        with engine.connect() as conn:
+            return pd.read_sql(query, conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+def record_capital_event(amount_krw: float, amount_usdt: float, fx_rate: float, notes: str):
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO capital_events (timestamp, amount_krw, amount_usdt, fx_rate, notes) "
+                "VALUES (NOW(), :krw, :usdt, :fx, :notes)"
+            ),
+            {"krw": amount_krw, "usdt": amount_usdt, "fx": fx_rate, "notes": notes},
+        )
+        conn.commit()
+
+
 def get_closed_positions():
     engine = get_db_engine()
     query = text(
@@ -153,15 +202,27 @@ if snap is not None:
 st.subheader("📈 Portfolio Performance (24h)")
 df_chart = get_portfolio_history()
 if not df_chart.empty:
-    base_usdt = df_chart["total_usdt_value"].iloc[0]
-    base_krw  = df_chart["total_krw_value"].iloc[0]
+    # Subtract capital deposits so the chart shows only organic P&L
+    df_events = get_capital_events_in_window()
+    if not df_events.empty:
+        df_chart["cumulative_deposits_usdt"] = df_chart["timestamp"].apply(
+            lambda t: float(df_events[df_events["timestamp"] <= t]["amount_usdt"].sum())
+        )
+    else:
+        df_chart["cumulative_deposits_usdt"] = 0.0
+
+    df_chart["organic_usdt"] = df_chart["total_usdt_value"] - df_chart["cumulative_deposits_usdt"]
+    df_chart["organic_krw"]  = df_chart["organic_usdt"] * df_chart["fx_rate"]
+
+    base_usdt = df_chart["organic_usdt"].iloc[0]
+    base_krw  = df_chart["organic_krw"].iloc[0]
     base_fx   = df_chart["fx_rate"].iloc[0]
 
     if base_usdt > 0 and base_krw > 0 and base_fx > 0:
         df_chart = df_chart.copy()
-        df_chart["USDT Equity"] = df_chart["total_usdt_value"] / base_usdt * 100
-        df_chart["KRW Equity"]  = df_chart["total_krw_value"]  / base_krw  * 100
-        df_chart["FX Rate"]     = df_chart["fx_rate"]          / base_fx   * 100
+        df_chart["USDT Equity"] = df_chart["organic_usdt"] / base_usdt * 100
+        df_chart["KRW Equity"]  = df_chart["organic_krw"]  / base_krw  * 100
+        df_chart["FX Rate"]     = df_chart["fx_rate"]       / base_fx   * 100
 
         df_long = df_chart[["timestamp", "USDT Equity", "KRW Equity", "FX Rate"]].melt(
             id_vars="timestamp", var_name="Series", value_name="Index"
@@ -221,11 +282,51 @@ if not df_chart.empty:
             use_container_width=True,
         )
 
+# 2b. CAPITAL MANAGEMENT
+with st.expander("💰 Record Capital Deposit / Withdrawal"):
+    current_fx = snap["fx_rate"] if snap is not None else 1450.0
+    dep_col, hist_col = st.columns([1, 1])
+
+    with dep_col:
+        st.caption("Add a deposit (positive) or withdrawal (negative)")
+        dep_krw = st.number_input(
+            "Amount (KRW)",
+            value=0,
+            step=100_000,
+            format="%d",
+            key="dep_krw",
+            help="Enter KRW added to Bithumb. Use a negative number for withdrawals.",
+        )
+        dep_notes = st.text_input("Notes (optional)", key="dep_notes", placeholder="e.g. Bithumb top-up")
+        dep_usdt = dep_krw / current_fx if current_fx > 0 else 0.0
+        st.caption(f"≈ ${dep_usdt:,.2f} USDT at FX {current_fx:,.0f}")
+        if st.button("✅ Record", key="dep_submit", disabled=(dep_krw == 0)):
+            record_capital_event(float(dep_krw), dep_usdt, current_fx, dep_notes)
+            st.success(f"Recorded: ₩{dep_krw:,} (${dep_usdt:,.2f})")
+            st.rerun()
+
+    with hist_col:
+        st.caption("Recent capital events")
+        df_cap = get_all_capital_events()
+        if not df_cap.empty:
+            df_cap_disp = df_cap.copy()
+            df_cap_disp["timestamp"] = pd.to_datetime(df_cap_disp["timestamp"]).dt.strftime("%m-%d %H:%M")
+            df_cap_disp["amount_krw"] = df_cap_disp["amount_krw"].apply(lambda x: f"₩{x:,.0f}")
+            df_cap_disp["amount_usdt"] = df_cap_disp["amount_usdt"].apply(lambda x: f"${x:,.2f}")
+            df_cap_disp["fx_rate"] = df_cap_disp["fx_rate"].apply(lambda x: f"{x:,.0f}")
+            df_cap_disp = df_cap_disp.rename(columns={
+                "timestamp": "Time", "amount_krw": "KRW", "amount_usdt": "USDT",
+                "fx_rate": "FX", "notes": "Notes"
+            })
+            st.dataframe(df_cap_disp, use_container_width=True, hide_index=True)
+        else:
+            st.info("No capital events recorded yet.")
+
 # 3. CONTROL PANEL
 st.subheader("⚙️ Bot Controls")
 config = load_config()
 if config:
-    c_sys, c_up, c_bi, c_co = st.columns([1, 2, 2, 2])
+    c_sys, c_up, c_bi = st.columns([1, 2, 2])
 
     with c_sys:
         is_paused = config.get("SYSTEM", {}).get("PAUSED", False)
@@ -273,36 +374,15 @@ if config:
             key="b_x",
         )
 
-    with c_co:
-        st.caption("COINONE Thresholds")
-        co_entry = st.number_input(
-            "Entry %",
-            value=float(config.get("COINONE", {}).get("ENTRY", -1.0)),
-            step=0.1,
-            format="%.2f",
-            key="co_e",
-        )
-        co_exit = st.number_input(
-            "Exit %",
-            value=float(config.get("COINONE", {}).get("EXIT", 2.0)),
-            step=0.1,
-            format="%.2f",
-            key="co_x",
-        )
-
     if st.button("💾 Save Thresholds"):
         if "UPBIT" not in config:
             config["UPBIT"] = {}
         if "BITHUMB" not in config:
             config["BITHUMB"] = {}
-        if "COINONE" not in config:
-            config["COINONE"] = {}
         config["UPBIT"]["ENTRY"] = u_entry
         config["UPBIT"]["EXIT"] = u_exit
         config["BITHUMB"]["ENTRY"] = b_entry
         config["BITHUMB"]["EXIT"] = b_exit
-        config["COINONE"]["ENTRY"] = co_entry
-        config["COINONE"]["EXIT"] = co_exit
         save_config(config)
         st.success("Configuration Updated!")
 
